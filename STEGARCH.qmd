@@ -1,0 +1,782 @@
+---
+title: "Exponential Spatiotemporal GARCH Model with Asymmetric Volatility Spillovers"
+author: "Ariane N. Meli Chrisko, Philipp Otto, Wolfgang Schmid"
+format:
+  html:
+    echo: true
+    toc: true  
+    self-contained: true   
+execute:
+  freeze: true  
+---
+
+## Exponential Spatiotemporal GARCH Model with Asymmetric Volatility Spillovers
+
+## Abstract
+
+A spatiotemporal exponential generalised autoregressive conditional heteroscedasticity (spatiotemporal E-GARCH) model is introduced here, extending traditional spatiotemporal GARCH models by incorporating asymmetric volatility spillovers, while also generalising the time-series E-GARCH model to a spatiotemporal setting with instantaneous, potentially asymmetric volatility spillovers across space. The model allows for both temporal and spatial dependencies in volatility dynamics, capturing how financial shocks propagate across time, space, and network structures. We establish the theoretical properties of the model, deriving stationarity conditions and moment existence results. We propose a quasi-maximum likelihood (QML) estimator for estimation and assess their finite-sample performance through Monte Carlo simulations. Empirically, we apply the model to financial networks, specifically analysing volatility spillovers in stock markets. We compare different network structures and analyse asymmetric effects in instantaneous volatility interactions.
+
+## The Model
+
+Let $\mathbf{s}_1, \cdots, \mathbf{s}_n$ denote the spatial locations, and let $\mathbf{Y}_t$ be the vector of observations at time $t$, defined as $\mathbf{Y}_t = \left(Y_t(\mathbf{s}_1), \ldots, Y_t(\mathbf{s}_n)\right)^\top$. We specify the outcome equation of a spatiotemporal EGARCH(1,1) model as follows:
+
+\begin{eqnarray} \mathbf{Y}_t &=& \text{diag}(\mathbf{h}_t)^{1/2} , \boldsymbol{\varepsilon}_t \label{eq:initial} \ \ln \mathbf{h}_t &=& \alpha_1 + \rho_0 \mathbf{W}_1 g(\boldsymbol{\varepsilon}t) + \rho_1 g(\boldsymbol{\varepsilon}{t-1}) + \lambda_0 \mathbf{W}_2 \ln \mathbf{h}t + \lambda_1 \ln \mathbf{h}{t-1} 
+\end{eqnarray}
+
+Here, $\mathbf{h}_t = \left(h_t(\mathbf{s}_1), \ldots, h_t(\mathbf{s}_n)\right)^\top$ is the vector of conditional variances, and $\boldsymbol{\varepsilon}_t = \left(\varepsilon_t(\mathbf{s}_1), \ldots, \varepsilon_t(\mathbf{s}_n)\right)^\top$ denotes the innovation terms, assumed to be independent and identically distributed with mean zero and constant variance. The term $\ln \mathbf{h}_t$ is applied element-wise. The asymmetric innovation effect is captured by the function
+
+\begin{equation} g(\boldsymbol{\varepsilon}_t) = \Theta \boldsymbol{\varepsilon}_t + \xi \left(|\boldsymbol{\varepsilon}_t| - \mathbb{E}|\boldsymbol{\varepsilon}_t|\right). 
+\end{equation}
+
+The full parameter vector is given by $\boldsymbol{\vartheta} = \left(\alpha_1, \rho_0, \rho_1, \lambda_0, \lambda_1, \Theta, \xi\right)^\top$. In this specification, $\rho_0 \mathbf{W}_1 g(\boldsymbol{\varepsilon}_t)$ captures spatial asymmetric effects, while $\rho_1 g(\boldsymbol{\varepsilon}_{t-1})$ accounts for temporal asymmetric effects. The parameters $\lambda_0$ and $\lambda_1$ describe the spatial and temporal dependence in the log-volatility process, respectively. The parameter $\Theta$ governs the response of volatility to shocks, and $\xi$ captures the leverage effect through the absolute innovation adjustment.
+
+## Required packages
+
+Below, we load different packages needed
+
+```{r, message=FALSE, warning=FALSE}
+library("rio")
+library("BatchGetSymbols")
+library("cluster")
+library("TSclust")
+library("lgarch")
+library("MASS")
+library("doParallel")
+library(ggplot2)
+library(reshape2)
+library(Rsolnp)
+library(classInt)
+library(nleqslv)
+library(Matrix)
+library("igraph")
+library("wesanderson")
+library(spdep)  # Load required package for spatial weights
+library(MTS)
+library(gplots)
+library(rugarch)
+library(gridExtra)
+library(dplyr)
+
+```
+
+## Function for simulation
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show function for simulation"
+
+simulate_spatiotemporal_EGARCH <- function(params, T, burnin, n, W_1, W_2) {
+  
+  # Check that weight matrices are provided and have correct dimensions
+  if (is.null(W_1) || is.null(W_2)) {
+    stop("You must provide both spatial weight matrices W_1 and W_2.")
+  }
+  if (nrow(W_1) != n || ncol(W_1) != n) {
+    stop("W_1 must be an n x n matrix.")
+  }
+  if (nrow(W_2) != n || ncol(W_2) != n) {
+    stop("W_2 must be an n x n matrix.")
+  }
+  
+  # Extract parameters from the list (for single theta)
+  rho_0    <- params$rho_0      # Spatial impact for current period
+  rho_1    <- params$rho_1      # Spatial impact for lagged period
+  theta    <- params$theta      # Single theta parameter
+  alpha    <- params$alpha      # Constant term in volatility
+  xi       <- params$xi         # Coefficient for absolute error adjustment
+  lambda_0 <- params$lambda_0   # Weight on spatial lags (for volatility adjustment)
+  lambda_1 <- params$lambda_1   # Weight on lagged volatility
+  Dist     <- params$errortype  # error distribution
+  # Compute the expected absolute value of a standard normal variable
+  mean_abs_eps <- sqrt(2/pi)
+  
+  # Total number of time periods (including burn-in)
+  total_T <- burnin + T
+  
+  # Preallocate a matrix for innovations (eps)
+  eps <- matrix(NA, n, total_T)
+  
+  # error distributions
+  if(Dist == "norm"){
+    for (t in 1:total_T) {
+      eps[, t] <- rnorm(n)
+    }
+    }
+  else if (Dist == "t"){
+    for (t in 1:total_T) {
+      eps[, t] <- rt(n, df = 3)
+    }
+    }
+
+  
+  # Compute the transformed errors g(eps) for each period:
+  # g(eps) = theta * eps + xi * (|eps| - E|eps|)
+  geps <- matrix(NA, n, total_T)
+  for (t in 1:total_T) {
+    geps[, t] <- theta * eps[, t] + xi * (abs(eps[, t]) - mean_abs_eps)
+  }
+  
+  # Generate an initial transformed error for the lagged term
+  if(Dist == "norm"){
+    geps0_init <- as.numeric(theta * rnorm(n) + xi * (abs(rnorm(n)) - mean_abs_eps))
+  }
+  else if (Dist == "t"){
+    geps0_init <- as.numeric(theta * rt(n, df = 3) + xi * (abs(rt(n, df = 3)) - mean_abs_eps))
+  }
+  
+  
+  # Preallocate matrices for log-volatility (lnh) and simulated outcome (Y)
+  lnh <- matrix(NA, n, total_T)
+  Y_out <- matrix(NA, n, total_T)
+  
+  # Initial log-volatility (can be drawn from a normal distribution)
+  if(Dist == "norm"){
+    lnh_0 <- rnorm(n)
+  }
+  else if (Dist == "t"){
+    lnh_0 <- rt(n, df = 3)
+  }
+  
+  # Compute spatial adjustment matrix: S = (I - lambda_0 * W_2)^{-1}
+  S <- solve(diag(n) - lambda_0 * W_2)
+  
+  # Simulation loop: recursively compute lnh and Y_out
+  for (t in 1:total_T) {
+    if (t == 1) {
+      lnh[, t] <- as.numeric(S%*%(lambda_1*lnh_0)+ S%*%rep(alpha,n)  + S%*%(rho_0* W_1)%*% geps[, t] + S%*% (rho_1*geps0_init)) # ...
+
+    } else {
+      lnh[, t] <- as.numeric(S%*%(lambda_1*lnh[, t-1])+ S%*%rep(alpha,n)  + S%*%(rho_0* W_1)%*% geps[, t] + S%*% (rho_1*geps[, t-1]))
+
+    }
+    Y_out[, t] <- sqrt(exp(lnh[, t])) * eps[, t]
+  }
+  
+  # Remove burn-in period
+  Y_final <- Y_out[, -(1:burnin)]
+  lnh_final <- lnh[, -(1:burnin)]
+  eps_final <- eps[, -(1:burnin)]
+  
+  return(list(Y = Y_final, lnh = lnh_final, eps = eps_final, params = params))
+}
+
+
+```
+
+## Usage of the simulation function
+
+```{r}
+# Create spatial weight matrices (5x5 grid, using rook contiguity)
+d <- 5
+n <- d^2
+W_1 <- nb2mat(cell2nb(d, d, type = "rook"))
+W_2 <- nb2mat(cell2nb(d, d, type = "rook"))
+
+# Define simulation settings
+T_sim  <- 200  # Number of time periods after burn-in
+burnin <- 50   # Burn-in period
+
+# Define parameter list 
+params <- list(
+  rho_0    = 0.25,
+  rho_1    = 0.3,
+  theta    = -0.5,
+  alpha    = 0.5,
+  xi       = 1,
+  lambda_0 = 0.35,
+  lambda_1 = 0.4,
+  errortype = "norm"
+)
+
+# Run the simulation
+steSimu <- simulate_spatiotemporal_EGARCH(params = params, T = T_sim, burnin = burnin, n = n, W_1 = W_1, W_2 = W_2)
+
+# Check dimensions of the simulated outcome
+print(dim(steSimu$Y))  # Expected: 25 x 200
+
+
+
+#visualisation 
+
+colours <- colorpanel(20, "pink", "yellow", "orange")  
+colbreaks <- classIntervals(steSimu$Y, n = length(colours), style = "quantile")
+
+par(mfcol = c(1, 2))
+
+# Plot the simulated time series for the first spatial location
+plot(steSimu$Y[1, ], type = "l", col = "blue",
+     main = "Simulation: Time Series at Location 1",
+     xlab = "Time", ylab = "Y")
+
+# Plot the observed lattice for the first time period (t = 1)
+image(1:d, 1:d, array(steSimu$Y[, 1], dim = c(d, d)),
+      col = colours, breaks = colbreaks$brks,
+      main = "Observed grid at t = 1",
+      xlab = "x", ylab = "y")
+
+
+```
+
+## Evaluating temporal asymmetry in simulated data
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show function for Egarch"
+
+#  Define EGARCH(1,1) model specification
+spec_egarch <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0)),
+  distribution.model = "std"  # Student-t for heavy tails
+)
+
+#  Function to fit EGARCH and extract asymmetry parameter (gamma1) and its p-value
+fit_egarch <- function(series) {
+  result <- tryCatch({
+    fit <- suppressWarnings(ugarchfit(spec = spec_egarch, data = series))
+    gamma <- coef(fit)["gamma1"]
+    p_value <- fit@fit$matcoef["gamma1", 4]
+    c(Gamma = as.numeric(gamma), P_Value = as.numeric(p_value))
+  }, error = function(e) c(Gamma = NA_real_, P_Value = NA_real_))
+  return(result)
+}
+
+```
+
+```{r}
+Datar_numeric <- t(steSimu$Y)
+
+#  Apply the function to each asset (column of Datar_numeric)
+results_list <- lapply(1:ncol(Datar_numeric), function(i) fit_egarch(Datar_numeric[, i]))
+
+# Combine the results into a clean data frame
+egarch_results <- as.data.frame(do.call(rbind, results_list))
+colnames(egarch_results) <- c("Gamma", "P_Value")
+rownames(egarch_results) <- colnames(Datar_numeric)  # Optional: label by asset name
+
+#  Count the number of assets with significant asymmetry (p < 0.05)
+asymmetric_count <- sum(egarch_results$P_Value < 0.05, na.rm = TRUE)
+
+# Display results
+#print(egarch_results)
+cat("Number of series with significant asymmetry (p < 0.05):", asymmetric_count, "\n")
+
+```
+
+## Numerical invertibility of the Model
+
+The innovations $(\varepsilon_t)$ are unobservable, and only the observed process $(\textbf{Y}_t)$ is available. Since the likelihood function is expressed in terms of the innovations, parameter estimation requires recovering $(\varepsilon_t)$ numerically. To avoid identification issues, we set $\xi = 1$. Using data generated from our simulation function, the innovations are estimated recursively by solving the system of equations below, where the innovation estimate $\tilde{\varepsilon}_{t, \vartheta}$ is computed for a given parameter vector $\vartheta$:
+\begin{eqnarray}
+    & (I& - \lambda_0 W_2)  \ln  \tilde{\varepsilon}_{t, \vartheta}^2 + \rho_0 W_1 g( \tilde{\varepsilon}_{t, \vartheta}) \; - \nonumber \\
+    & \quad &\left((I - \lambda_0 W_2) \ln Y_t^2 - \alpha - \rho_1 g( \tilde{\varepsilon}_{t-1, \vartheta}) - \lambda_1 \ln Y_{t-1}^2 + \lambda_1 \ln  \tilde{\varepsilon}_{t-1, \vartheta}^2 \right) = 0.
+\end{eqnarray}
+We initialise the recursion with $Y_0(s) = 0.0001$ and $\varepsilon_0(s) = 0.0001$ for all spatial locations $s$, and assume $E|\varepsilon_t|$ equals the expected value of a standard normal distribution. At each time point $t$, the system is solved using the \texttt{nleqslv} solver. This numerical inversion must be repeated for every parameter vector $\vartheta$ during the likelihood maximisation.
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show function for invertibility"
+
+invert_g <- function(y, alpha, rhoW_1, lambdaW_2, rho_1, lambda_1, theta, xi, eps_lag, Y_lag) {
+  n <- length(y)
+  # Expected absolute mean of a standard normal
+  mean_abs_eps <- sqrt(2/pi)
+  xi<- 1
+  
+  # Define the function mapping from epsilon to the transformed error expression
+  # This function represents the equation we want to invert.
+  function_y_eps <- function(x, y, alpha, rhoW_1, lambdaW_2, rho_1, lambda_1, theta, xi) {
+    n <- length(x)
+    eps <- x
+    return((diag(n) - lambdaW_2) %*% log(abs(y)^2) -
+             (rep(alpha, n) +
+                rhoW_1 %*% (theta * eps + xi * (abs(eps) - mean_abs_eps)) +
+                rho_1 * (theta * eps_lag + xi * (abs(eps_lag) - mean_abs_eps)) +
+                lambda_1 * (log(abs(Y_lag)^2) - log(abs(eps_lag)^2)) +
+                (diag(n) - lambdaW_2) %*% log(abs(eps)^2)))
+  }
+  
+  # Solve for eps using nleqslv
+  out <- nleqslv(x = y, fn = function_y_eps, alpha = alpha, rhoW_1 = rhoW_1, lambdaW_2 = lambdaW_2, 
+                 rho_1 = rho_1, lambda_1 = lambda_1, theta = theta, xi = xi, y = y, control = list(ftol = 1e-10))
+  
+  # Recover the estimated eps, enforcing the sign of y
+   eps <- sign(y) * abs(out$x)   #out$x
+   
+  # Compute the implied log-volatility: ln h = log(|y|^2) - log(|eps|^2)
+  lnh <- log(abs(y)^2) - log(abs(eps)^2)
+  return(list(eps = eps, lnh = lnh))
+}
+
+
+```
+
+```{r}
+
+# Extract simulation output and parameters
+Y <- steSimu$Y         # Simulated outcomes (n x T)
+eps_true <- steSimu$eps  # True innovations (n x T)
+params <- steSimu$params
+
+alpha    <- params$alpha
+rho_0    <- params$rho_0
+rho_1    <- params$rho_1
+theta    <- params$theta
+xi       <- params$xi
+lambda_0 <- params$lambda_0
+lambda_1 <- params$lambda_1
+
+# Determine dimensions
+T <- ncol(Y)  # Number of time periods (post burnin)
+n <- nrow(Y)  # Number of spatial locations
+
+# Preallocate matrices for estimated latent errors and log-volatility
+lnh_hat <- matrix(NA, n, T)
+eps_hat <- matrix(NA, n, T)
+diff_squared <- matrix(NA, n, T)
+
+# Loop over time periods to invert the mapping and recover eps and log-volatility
+
+for (t in 1:T) {
+  if(t == 1){
+    out <- invert_g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta = theta, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+             eps_lag = rep(0.01, length(Y[, t])), Y_lag = rep(0.01, length(Y[, t])))
+  } else {
+    out <- invert_g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta = theta, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+             eps_lag = eps_hat[,t-1], Y_lag = Y[,t-1])
+  }
+  eps_hat[,t] <- out$eps
+  lnh_hat[,t] <- out$lnh
+  diff_squared[, t] <- (eps_hat[, t] - eps_true[, t])^2
+}
+
+# Identify the first time point where the maximum of (eps - eps_hat)^2 across all locations is less than 0.05
+time_point <- which(apply(diff_squared, 2, max) < 0.05)[1]
+
+# Plot the difference (eps - eps_hat)^2 over time
+plot(1:T, apply(diff_squared, 2, max), type = "l", xlab = "t", ylab = expression((epsilon - tilde(epsilon))^2), main = "Squared differences across all locations")
+abline(h = 0.05, col = "red", lty = 2) # Add a horizontal line at 0.05
+points(time_point, max(diff_squared[, time_point]), col = "blue", pch = 19) # Mark the time point where (eps - eps_hat)^2 becomes less than 0.05
+symbols(time_point, max(diff_squared[, time_point]), circles = 0.5, inches = 0.1, add = TRUE, fg = "blue")
+
+
+```
+
+### Evaluating the inverse function
+
+Thus, an efficient solver such as the \texttt{nleqslv} solver is important for a good computational performance. Below, we first focus on the differences between $\tilde{\varepsilon_t}$ and $\varepsilon_t$ for the true data-generating parameters $\vartheta_0$ for each time point $t$. Secondly, we analyse the same differences but for parameters $\vartheta$ away from $\vartheta_0$ to show that the differences are, indeed, minimised at $\vartheta = \vartheta_0$.
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show functions needed for invertibility"
+
+pairing_params_plot <- function(param1_name, param2_name, param_grids, true_params) {
+  param1_grid <- param_grids[[param1_name]]
+  param2_grid <- param_grids[[param2_name]]
+  
+  
+  results <- data.frame(param1 = double(), param2 = double(), A = double(), B = double())
+  
+  for (param1 in param1_grid) {
+    for (param2 in param2_grid) {
+      lnh_hat <- array(NA, dim = c(n, T))
+      eps_hat <- array(NA, dim = c(n, T))
+      for (t in 1:T) {
+        current_params <- true_params
+        current_params[[param1_name]] <- param1
+        current_params[[param2_name]] <- param2
+        
+        if (t == 1) {
+          out <- invert_g(Y[, t], 
+                   alpha = current_params$alpha,
+                   rhoW_1 = current_params$rho_0 * W_1, 
+                   lambdaW_2 = current_params$lambda_0 * W_2, 
+                   theta = current_params$theta, 
+                   xi = current_params$xi, 
+                   rho_1 = current_params$rho_1, 
+                   lambda_1 = current_params$lambda_1,
+                   eps_lag = rep(0.0001, length(Y[, t])), 
+                   Y_lag = rep(0.0001, length(Y[, t])))
+        } else {
+          out <- invert_g(Y[, t], 
+                   alpha = current_params$alpha,
+                   rhoW_1 = current_params$rho_0 * W_1, 
+                   lambdaW_2 = current_params$lambda_0 * W_2, 
+                   theta = current_params$theta, 
+                   xi = current_params$xi, 
+                   rho_1 = current_params$rho_1, 
+                   lambda_1 = current_params$lambda_1,
+                   eps_lag = eps_hat[, t - 1], 
+                   Y_lag = Y[, t - 1])
+        }
+        eps_hat[, t] <- out$eps
+        lnh_hat[, t] <- out$lnh
+      }
+      
+      A <- sum((eps_hat - eps_true)^2)
+      B <- sum((eps_hat[, -(1:5)] - eps_true[, -(1:5)])^2)
+      
+      results <- rbind(results, data.frame(param1 = param1, param2 = param2, A = round(A, 3), B = round(B, 3)))
+    }
+  }
+  
+  colnames(results)[1:2] <- c(param1_name, param2_name)
+  param1_breaks <- c(param1_grid[1], true_params[[param1_name]], param1_grid[length(param1_grid)])
+  param2_breaks <- c(param2_grid[1], true_params[[param2_name]], param2_grid[length(param2_grid)])
+  
+  
+  param1_label <- switch(param1_name,
+                         alpha = expression(alpha),
+                         rho_0 = expression(rho[0]),
+                         rho_1 = expression(rho[1]),
+                         lambda_0 = expression(lambda[0]),
+                         lambda_1 = expression(lambda[1]),
+                         theta = expression(theta),
+                         param1_name)  # Fallback to the name itself if no match
+  
+  param2_label <- switch(param2_name,
+                         alpha = expression(alpha),
+                         rho_0 = expression(rho[0]),
+                         rho_1 = expression(rho[1]),
+                         lambda_0 = expression(lambda[0]),
+                         lambda_1 = expression(lambda[1]),
+                         theta = expression(theta),
+                         param2_name)  # Fallback to the name itself if no match
+  
+  
+  # Plotting B or A
+  p1 <- ggplot(results, aes(x = .data[[param1_name]], y = .data[[param2_name]], fill = .data[["B"]])) +
+    geom_tile() +
+    scale_fill_gradient(name = NULL,low = "white", high = "grey") +
+    geom_vline(xintercept = true_params[[param1_name]], linetype = "dashed", color = "green") +
+    geom_hline(yintercept = true_params[[param2_name]], linetype = "dashed", color = "green") +
+    #ggtitle(paste("Variation of B with", param1_name, "and", param2_name)) +
+    theme_minimal()+
+    
+    theme(
+      aspect.ratio = 1,
+      legend.key.size = unit(0.9, "lines"),  # Adjust the size of the legend
+      legend.text = element_text(size = 9),  # Adjust the size of the legend text
+      #axis.title.x = element_blank(),
+      #axis.title.y = element_blank()
+    ) +
+    scale_x_continuous(breaks = param1_breaks) +
+    scale_y_continuous(breaks = param2_breaks) +
+    #scale_x_continuous(breaks = true_params[[param1_name]]) +
+    #scale_y_continuous(breaks = true_params[[param2_name]]) +
+    guides(fill = guide_colorbar(keywidth = 0.5, keyheight = 2)) +
+    labs(x = param1_label, y = param2_label)  # Set axis labels
+  
+  return(p1)
+}
+
+
+# Generating all possible pairs of parameters
+generate_param_pairs <- function(param_names) {
+  param_pairs <- list()
+  k <- length(param_names)
+  for (i in 1:(k-1)) {
+    for (j in (i+1):k) {
+      param_pairs <- append(param_pairs, list(c(param_names[i], param_names[j])))
+    }
+  }
+  return(param_pairs)
+}
+
+
+```
+
+```{r, cache=TRUE}
+# Defining parameter grids
+
+param_grids <- list(
+  alpha = seq(alpha-0.02, alpha+0.02, by=0.01 ),
+  rho_0 = seq(rho_0-0.02, rho_0+0.02, by = 0.01),
+  rho_1 = seq(rho_1-0.02, rho_1+0.02, by = 0.01),
+  lambda_0 = seq(lambda_0-0.02, lambda_0+0.02, by = 0.01),
+  lambda_1 = seq(lambda_1-0.02, lambda_1+0.02, by = 0.01),
+  theta = seq(theta-0.02, theta+0.02, by = 0.01)
+  #xi = seq(xi-0.02, xi+0.02, by = 0.01)
+)
+
+
+# Defining the list of true_params
+true_params <- list(alpha = alpha, rho_0 = rho_0, rho_1 = rho_1, lambda_0 = lambda_0, lambda_1 = lambda_1, theta = theta)
+
+# generating pairs
+param_names <- c("alpha", "rho_0", "rho_1", "lambda_0", "lambda_1", "theta")
+param_pairs <- generate_param_pairs(param_names)
+
+
+
+# Initialize an empty list to store all the plots
+all_plots <- list()
+
+# Iterate over each parameter pair
+for (pair in param_pairs) {
+  param1 <- pair[1]
+  param2 <- pair[2]
+  #cat("Processing pair:", param1, "vs", param2, "\n")
+  
+  # Create a plot for the current parameter pair
+  current_plot <- pairing_params_plot(param1, param2, param_grids, true_params)
+  
+  # Store the plot in the list
+  all_plots[[paste(param1, "vs", param2)]] <- current_plot
+}
+
+
+# Combine all plots in a grid layout with 7 rows and 3 columns
+combined_plot <- grid.arrange(grobs = all_plots, nrow = 5, ncol = 3)
+
+#print(combined_plot)
+
+
+
+```
+
+## Procedure for Maximum Likelihood Estimation 
+
+In the following section, we focus on estimating the parameter vector $\vartheta = (\alpha, \rho_0, \rho_1, \lambda_0, \lambda_1, \Theta, \xi)'$. For identification purposes, we fix $\xi = 1$. The maximum likelihood estimation relies on the previously defined numerical mapping from the observed process $\mathbf{Y}_t$ to the unobserved innovations $\mathbf{\varepsilon}_t$.
+
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show estimation function"
+
+
+estimate_EGARCH <- function(Y, W_1, W_2, initial_params, silent = TRUE) {
+  
+  # Input checks
+  if (is.null(Y)) stop("Y is missing")
+  if (is.null(W_1) || is.null(W_2)) stop("Both W_1 and W_2 are required")
+  if (!all(dim(W_1) == dim(W_2))) stop("W_1 and W_2 must have the same dimensions")
+  
+  n <- nrow(Y)
+  T_periods <- ncol(Y)
+  
+  # Log transformation of Y^2 (handling zeros)
+  if (any(Y == 0)) {
+    warning("Zero values detected in Y. Replacing them with the smallest non-zero entry.")
+    Y <- ifelse(Y == 0, log(min(Y[Y != 0]^2)), log(Y^2))
+  } else {
+    Y <- log(Y^2)
+  }
+  
+  # ---- Unpacking Initial Parameters ----
+  rho_0    <- initial_params[1]
+  rho_1    <- initial_params[2]
+  theta    <- initial_params[3]
+  alpha    <- initial_params[4]
+  lambda_1 <- initial_params[5]
+  lambda_0 <- initial_params[6]
+  xi       <- 1  # Fixed in our model
+  
+  
+  
+  # ---- Define the Derivative Function: d_h/d_eps ----
+  d_h_d_eps <- function(eps, h, alpha, theta, xi, rhoW_1, lambdaW_2) {
+    tau_eps_prime <- function(eps, theta, xi){
+      return(theta + xi*sign(eps))
+    }
+    n     <- length(eps)
+    aux   <- solve(diag(n) - Matrix(lambdaW_2)) %*% Matrix(rhoW_1)
+    eps_j <- t(array(rep(eps, n), dim = c(n, n)))
+    h_i   <- array(rep(h, n), dim = c(n, n))
+    return( aux %*% tau_eps_prime(eps_j, theta, xi) * (h_i))
+  }
+  
+  # ---- Define the Likelihood Function ----
+  likelihood <- function(params, Y, W_1, W_2) {
+    
+    rho_0    <- params[1]
+    rho_1    <- params[2]
+    theta    <- params[3]
+    alpha    <- params[4]
+    lambda_1 <- params[5]
+    lambda_0 <- params[6]
+    eps_hat <- matrix(0.01, n, T_periods)
+    
+    # Compute log of the determinant of the jacobian matrix
+    log_det_J <- numeric(T)
+    for (t in 1:T) {
+      if(t == 1){
+        out <- invert_g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta = theta, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+                 eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+      } else {
+        out <- invert_g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta = theta, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+                 eps_lag = eps_hat[,t-1], Y_lag = Y[,t-1])
+      }
+      eps_hat[,t] <- out$eps
+      
+      h_hat       <- exp(out$lnh)
+      J <- 0.5 * (out$eps / sqrt(h_hat)) * d_h_d_eps(out$eps, h_hat, alpha, theta, xi, rho_0 * W_1, lambda_0 * W_2) + diag(sqrt(h_hat))
+      log_det_J[t] <- determinant(J, logarithm = TRUE)$modulus 
+    }
+    
+    likelihood <-  sum(log(dnorm(eps_hat[,-(1:5)]))) - sum(log_det_J[-(1:5)]) #sum(log(dnorm(t(Y)%*%diag((sqrt(1/h_hat))))))
+    
+    return(-likelihood)  # Return negative likelihood for maximization
+  }
+  
+  # ---- Parameter Bounds ----
+  LB <- c(0.0001, 0.0001, -1, -10, 0.0001, 0.0001)
+  UB <- c(0.99, 0.999999999999, 1, 100, 1, 0.99)
+  
+  # ---- Prepare Extra Arguments ----
+  
+  
+  # ---- Run Estimation ----
+  resultll <- solnp(
+    pars = initial_params,
+    fun = likelihood,
+    LB = LB,
+    UB = UB,
+    control = list(trace = ifelse(silent, 0, 1)),
+    Y = Y, W_1 = W_1, W_2 = W_2  
+    )
+  
+  
+  # ---- Extract Results ----
+  est_params <- resultll$pars
+  k <- length(est_params)
+  nObs <- nrow(Y) * ncol(Y)
+  
+  logLik_opt <- -resultll$values[length(resultll$values)]
+  AIC <- 2 * k - 2 * logLik_opt
+  BIC <- log(nObs) * k - 2 * logLik_opt
+  
+  #se <- sqrt(diag(solve(resultll$hessian)))
+  #t_stat <- est_params / se
+  
+  # ---- Compute Estimated Volatility (h_hat) ----
+  eps_hat <- matrix(0.01, n, T_periods)
+  h_hat <- matrix(0.01, n, T_periods)
+  
+  for (t in 1:T_periods) {
+    if(t == 1){
+      out <- invert_g(Y[, t], alpha = est_params[4], rhoW_1 = est_params[1] * W_1, lambdaW_2 = est_params[6] * W_2, theta = est_params[3], xi = 1, rho_1 = est_params[2], lambda_1 = est_params[5],
+               eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+    } else {
+      out <- invert_g(Y[, t], alpha = est_params[4], rhoW_1 = est_params[1] * W_1, lambdaW_2 = est_params[6] * W_2, theta = est_params[3], xi = 1, rho_1 = est_params[2], lambda_1 = est_params[5],
+               eps_lag = eps_hat[,t-1], Y_lag = Y[,t-1])
+    }
+    eps_hat[,t] <- out$eps
+    h_hat       <- exp(out$lnh)
+    }
+  
+  return(list(
+    estimated_params = est_params,
+    logLik = logLik_opt,
+    AIC = AIC,
+    BIC = BIC,
+    eps_hat = eps_hat,
+    h_hat = h_hat,
+    result = resultll
+  ))
+}
+
+
+```
+
+```{r, cache=TRUE, warning=FALSE}
+# ---- Example Usage ----
+
+
+# Set initial parameters
+initial_params <- c(
+  rho_0 = 0.15,
+  rho_1 = 0.23,
+  theta = 0.02,
+  alpha = sd(Y),
+  lambda_1 = 0.11,
+  lambda_0 = 0.25
+)
+
+# Run estimation
+result_est <- estimate_EGARCH(Y, W_1, W_2, initial_params, silent = "TRUE")
+
+# Print results
+print(result_est$estimated_params)
+print(result_est$AIC)
+
+
+```
+
+## Mini Monte Carlo simulation study
+
+```{r, cache=TRUE, warning=FALSE}
+
+
+# Settings
+r <- 25                      # Number of Monte Carlo replications
+d <- 5                       # Grid dimension
+n <- d^2                     # Total locations
+T <- 100                     # Time series length
+burnin <- 10                 # Burn-in period
+
+# Spatial weights
+W_1 <- nb2mat(cell2nb(d, d, type = "queen"))
+W_2 <- nb2mat(cell2nb(d, d, type = "rook"))
+
+# True parameters as a named list
+true_params <- list(
+  rho_0 = 0.5,  
+  rho_1 = 0.35,
+  theta = 0.4,
+  alpha = 0.5,
+  xi = 1,
+  lambda_1 = 0.3,
+  lambda_0 = 0.2,
+  errortype = "norm"
+)
+
+param_names <- c("rho_0", "rho_1", "theta", "alpha", "lambda_1", "lambda_0")
+results_matrix <- matrix(NA, nrow = r, ncol = length(param_names))
+colnames(results_matrix) <- param_names
+
+# Monte Carlo loop
+for (i in 1:r) {
+  #cat("Replication", i, "\n")
+  # Simulate data
+  sim <- simulate_spatiotemporal_EGARCH(
+    params = true_params, T = T, burnin = burnin, n = n,
+    W_1 = W_1, W_2 = W_2
+  )
+  
+  Y_sim <- sim$Y
+  
+  # Estimate model
+  est_result <- tryCatch(
+    estimate_EGARCH(Y = Y_sim, W_1 = W_1, W_2 = W_2, initial_params = unlist(true_params[param_names]), silent = TRUE),
+    error = function(e) {
+      warning(paste("Estimation failed at iteration", i))
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(est_result)) {
+    results_matrix[i, ] <- est_result$estimated_params
+  }
+}
+
+# Convert to data frame
+results_df <- as.data.frame(results_matrix)
+results_df$Replication <- 1:r
+results_long <- melt(results_df, id.vars = "Replication", variable.name = "Param", value.name = "Estimate")
+results_long$True <- rep(unlist(true_params[param_names]), each = r)
+
+# Summary table
+summary_table <- results_long %>%
+  group_by(Param) %>%
+  summarise(
+    True_Value = unique(True),
+    Mean_Estimate = mean(Estimate, na.rm = TRUE),
+    Bias = round(mean(Estimate - True, na.rm = TRUE), 4),
+    RMSE = round(sqrt(mean((Estimate - True)^2, na.rm = TRUE)), 4),
+    Std_Dev = round(sd(Estimate, na.rm = TRUE), 4)
+  )
+
+# Output
+print(summary_table)
+
+```
