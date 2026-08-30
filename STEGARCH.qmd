@@ -574,16 +574,14 @@ estimate_EGARCH <- function(Y, W_1, W_2, initial_params, silent = TRUE) {
   
   
   # ---- Define the Derivative Function: d_h/d_eps ----
-  d_h_d_eps <- function(eps, h, alpha, theta, xi, rhoW_1, lambdaW_2) {
-    tau_eps_prime <- function(eps, theta, xi){
-      return(theta + xi*sign(eps))
-    }
-    n     <- length(eps)
-    aux   <- solve(diag(n) - Matrix(lambdaW_2)) %*% Matrix(rhoW_1)
-    eps_j <- t(array(rep(eps, n), dim = c(n, n)))
-    h_i   <- array(rep(h, n), dim = c(n, n))
-    return( aux %*% tau_eps_prime(eps_j, theta, xi) * (h_i))
-  }
+d_h_d_eps <- function(eps, h, theta_0, xi, rhoW_1, lambdaW_2) {
+  n <- length(eps)
+  A <- solve(diag(n) - lambdaW_2, rhoW_1)
+  gprime <- theta_0 + xi * sign(eps)
+  Dlogh <- sweep(A, 2, gprime, `*`)
+  Dh <- sweep(Dlogh, 1, h, `*`)
+  return(Dh)
+}
   
   # ---- Define the Likelihood Function ----
   likelihood <- function(params, Y, W_1, W_2) {
