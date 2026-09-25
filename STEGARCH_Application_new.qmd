@@ -1,0 +1,1303 @@
+---
+title: "Spatiotemporal EGARCH: Application to the CAC40 stock Market"
+author: "Ariane N. Meli Chrisko, Philipp Otto, Wolfgang Schmid"
+format:
+  html:
+    echo: true
+    toc: true 
+    self-contained: true  
+bibliography: reference.bib  
+execute:
+   freeze: true
+---
+
+## Exponential Spatiotemporal GARCH Model with Asymmetric Volatility Spillovers: Application to CAC40 stock market
+
+In this analysis, we explore the spatiotemporal dependencies and volatility dynamics in stock return data using the CAC40 index as a case study. The dataset is obtained via the `BatchGetSymbols` package, retrieving daily log returns for constituent stocks over a specified period. To model the interdependencies among stocks, we apply a spatial dynamic panel data (SDPD) model for the mean process, followed by a spatiotemporal EGARCH model for the residual volatility. The network structure is captured via different dissimilarity-based spatial weight matrices, reflecting economic and statistical relationships between stocks. The same pipeline can be applied to the NYSE and DAX by simply providing the appropriate tickers for each market and replacing the `bench.ticker` argument with `"^GSPC"` for NYSE and `"^GDAXI"` for DAX, respectively. The SDPD mean model and spatiotemporal EGARCH volatility estimation can be reused without modification; only the input data Y and spatial weight matrices need to be regenerated based on the updated stock set.
+
+## Loading packages
+
+```{r, message=FALSE, cache=FALSE, warning=FALSE}
+library("rio")
+library("BatchGetSymbols")
+library("cluster")
+library("TSclust")
+library("lgarch")
+library("MASS")
+library("doParallel")
+library(ggplot2)
+library(reshape2)
+library(Rsolnp)
+library(classInt)
+library(nleqslv)
+library(Matrix)
+library("igraph")
+library("wesanderson")
+library(spdep) 
+library(MTS)
+library(gplots)
+library(rugarch)
+library(gridExtra)
+library(dplyr)
+
+```
+
+## Data Import & Preprocessing Explain
+
+```{r, cache=TRUE,  message=FALSE, warning=FALSE}
+# Load data using an excel sheet containing the tickers
+
+DJIA.dat <- rio::import("cac40_at_2020.xlsx")
+tickers <- DJIA.dat$Symbol
+tickers <- tickers[tickers != "STLAP.PA"]
+
+start.date <- as.Date("2019-10-01")
+end.date <- as.Date("2022-10-31")
+
+l.out <- BatchGetSymbols(tickers = tickers,
+                         first.date = start.date, 
+                         last.date =  end.date, 
+                         thresh.bad.data = 1, 
+                         bench.ticker = "^FCHI",
+                         type.return = "log",
+                         freq.data = "daily") 
+
+export(l.out,"l.out.RDS")
+Datar <- unstack(l.out$df.tickers, l.out$df.tickers$ret.adjusted.prices~l.out$df.tickers$ticker)
+Datar <- Datar[-1,]
+
+train.l <-  731  # fitting the model on two years data
+
+# Adjust data in a proper way (replacing null values by randon N(0,0.001))
+logDatar2 <- Datar[1:train.l, ]
+
+cat("Standard deviation of returns over the considered period :\n")
+print(apply(logDatar2, 2, sd))
+
+# Initialize a vector to store zero counts per column
+zero_counts <- ncol(logDatar2) 
+
+#  count zeros and replace random
+for (i in 1:ncol(logDatar2)) {
+  zero_counts[i] <- sum(logDatar2[, i] == 0)  # Count zero values in each column
+  logDatar2[, i] <- ifelse(logDatar2[, i] == 0, rnorm(1, 0, 0.001), logDatar2[, i]) 
+}
+
+# Get names of columns with non-zero counts of zeros
+columns_with_zeros <- zero_counts[zero_counts > 0]
+names(columns_with_zeros) <- colnames(logDatar2)[zero_counts > 0]
+
+cat("Stocks with returns equal to zero on some days:\n")
+print(columns_with_zeros)
+
+cat("\nPercentage of zero returns in the dataset: ",
+    round((sum(zero_counts) / (nrow(logDatar2) * ncol(logDatar2))) * 100, 3), "%\n")
+
+cat("Dimensions of logDatar2: ", paste(dim(logDatar2), collapse = " x "), "\n")
+
+```
+
+## Data Visualization
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE}
+
+# Create a data frame with an additional 'Time' column to represent the sequence of dates or time points
+df <- data.frame(Time = 1:nrow(logDatar2), logDatar2)
+
+# Melt the data frame to long format for ggplot
+df_melted <- melt(df, id.vars = "Time")
+
+
+# Plot using ggplot2
+ggplot(df_melted, aes(x = Time, y = value)) +
+  geom_line(color = "blue", alpha = 0.8) +
+  labs(title = "Time series of log returns for CAC40 stocks",
+       x = "Time",
+       y = "Log Returns") +
+  theme_minimal() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 5)  # Adjust ncol to control the number of columns
+
+
+
+```
+
+## Matrix Construction and Network Definition
+
+For our analysis, we adopt three types of network structures proposed by @mattera2024network , each based on a different dissimilarity measure: one derived from empirical correlations among stock returns, another based on inverse Euclidean distance, and a third based on the Piccolo distance derived from an autoregressive model of infinite order (AR($\infty$)) of the log-squared returns. The network weights are constructed using a $k$-nearest neighbours approach, where each node is connected to its $k$ closest neighbours, and the weights are defined as:
+
+$$
+w_{ij} = 
+\begin{cases}
+\frac{1}{k}, & \text{if } i \text{ is among the } k \text{ nearest neighbours of } j \\
+0, & \text{otherwise}
+\end{cases}
+$$
+
+In our implementation, we set $k = 5$.
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+
+# Construct the W matrix:
+# Construct the W matrix: Approach 1
+
+# Alternative A: standard Euclidean distance
+
+D_EUCL <- as.matrix(dist(t(Datar[1:train.l, ]), method = "euclidean"))
+
+Wmat1 <- 1 / D_EUCL
+diag(Wmat1) <- 0
+Wmat1 <- Wmat1 / max(eigen(Wmat1, only.values = TRUE)$values)
+
+# Alternative B: correlation-based distance
+
+X <- t(Datar[1:train.l, ])
+
+C <- cor(t(X), use = "pairwise.complete.obs")
+
+D_COR <- 1 - C
+diag(D_COR) <- 0
+
+Wmat2 <- 1 / D_COR
+diag(Wmat2) <- 0
+Wmat2 <- Wmat2 / max(eigen(Wmat2, only.values = TRUE)$values)
+
+# Alternative C: log-ARCH approach
+
+
+logARCH_coefficients <- function(X, p = 1, eps = 1e-8) {
+  n <- nrow(X)
+  coef.mat <- matrix(NA, n, p + 1)
+  for (i in 1:n) {
+    z <- log(X[i, ]^2 + eps)
+    Y <- z[(p + 1):length(z)]
+    Z <- embed(z, p + 1)
+    # response and lagged predictors
+    Xreg <- Z[, -1, drop = FALSE]
+    fit <- lm(Y ~ Xreg)
+    coef.mat[i, ] <- coef(fit)
+  }
+  coef.mat
+}
+
+Xlog <- t(logDatar2[1:train.l, ])
+
+theta <- logARCH_coefficients(Xlog, p = 3)
+
+D_ARPIC <- as.matrix(dist(theta))
+
+Wmat3 <- 1 / D_ARPIC
+diag(Wmat3) <- 0
+
+Wmat3 <- Wmat3 /
+  max(eigen(Wmat3, only.values = TRUE)$values)
+
+# Approach 2: k-nearest neighbours
+
+# Alternative A: standard Euclidean distance
+
+dist_mat1 <- as.matrix(
+  dist(t(logDatar2[1:train.l, ]), method = "euclidean")
+)
+
+k <- 5 # Choose 3, 5 or 10
+Wmat1_10    <- t(sapply(1:ncol(dist_mat1), function(i) ifelse(dist_mat1[i,] < sort(dist_mat1[i,])[k+2] & dist_mat1[i,] > 0, 1/k, 0))) # k+2, because of the diagonal zero entry and the strict inequality
+diag(Wmat1_10) <- 0
+
+# Alternative B: correlation-based similarity
+
+X <- t(logDatar2[1:train.l, ])
+dist_mat2 <- 1 - cor(t(X), use = "pairwise.complete.obs")
+diag(dist_mat2) <- 0
+
+k <- 5 # Choose 3, 5 or 10
+Wmat2_10    <- t(sapply(1:ncol(dist_mat2), function(i) ifelse(dist_mat2[i,] < sort(dist_mat2[i,])[k+2] & dist_mat2[i,] > 0, 1/k, 0))) # k+2, because of the diagonal zero entry and the strict inequality
+diag(Wmat2_10) <- 0
+
+
+# Alternative C: log-ARCH approach
+
+dist_mat3 <- D_ARPIC # as.matrix(diss(t(logDatar2[1:train.l, ]), "AR.PIC"))
+
+k <- 5 # Choose 3, 5 or 10
+Wmat3_10    <- t(sapply(1:ncol(dist_mat3), function(i) ifelse(dist_mat3[i,] < sort(dist_mat3[i,])[k+2] & dist_mat3[i,] > 0, 1/k, 0))) # k+2, because of the diagonal zero entry and the strict inequality
+diag(Wmat3_10) <- 0
+
+#dist_mat4 <- readRDS("cac40_hq_weights.rds")$dist_mat4
+#Wmat4_10 <- readRDS("cac40_hq_weights.rds")$Wmat4_10
+
+
+
+# Directed network definition and plot for correlation-based matrix
+
+# Define node names
+names <- names(Datar)
+
+# Create a directed network object using 5-NN weight matrix
+network <- tibble(
+  from = names[which(Wmat2_10 > 0, arr.ind = TRUE)[,1]],
+  to = names[which(Wmat2_10 > 0, arr.ind = TRUE)[,2]]
+)
+
+# Extract nonzero edges from Wmat3_10 (5-NN adjacency matrix)
+edges <- which(Wmat2_10 > 0, arr.ind = TRUE)
+
+# Create a directed graph
+g1 <- graph(edges = as.vector(t(edges)), n = dim(Wmat2_10)[1], directed = TRUE)
+E(g1)$color <-  "gray"
+# Assign node labels and colors
+V(g1)$label <- names
+V(g1)$color <- wes_palette("FantasticFox1", length(V(g1)), type = "continuous")
+
+# Use a force-directed layout (better for directed graphs)
+plot(g1, layout =layout_with_kk(g1) , main = "CAC40 Directed 5-NN Network(CORR)",  
+     edge.arrow.size = 0.4,  # Small arrows
+     edge.width = 0.9,       # Thinner edges
+     vertex.size = 14,        # Adjust node size for readability
+     vertex.label.cex = 0.8  # Make text labels smaller
+)
+
+
+```
+
+## Estimating a spatiotemporal autoregressive model
+
+To remove the dependencies caused by temporal autocorrelation and cross-sectional spillovers in stock returns, we fit a spatial dynamic panel data (SDPD) model as the mean equation before modelling the residuals separately. We follow the SDPD specification without exogenous regressors by @lee2012qml :
+
+$$
+\mathbf{Y}_t = \rho \mathbf{W}_1 \mathbf{Y}_t + \gamma \mathbf{Y}_{t-1} + \lambda \mathbf{W}_2 \mathbf{Y}_{t-1} + \mathbf{u}_t,
+$$
+
+where $\rho \mathbf{W}_1 \mathbf{Y}_t$ captures contemporaneous spatial dependence, $\gamma \mathbf{Y}_{t-1}$ accounts for temporal autocorrelation, and $\lambda \mathbf{W}_2 \mathbf{Y}_{t-1}$ represents spatiotemporal spillover effects. The model residuals $\mathbf{u}_t$, referred to as `residuals` in the code.
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show estimation function for a STAR"
+
+
+LL_SDPD_beta <- function( params, Y, W_1, W_2){ #param y,X,W1,W2,W3
+  
+  # theta c(rho,lambda,gamma,sigma2,beta_1,...,beta_K)
+  
+  N <- dim(Y)[1]
+  
+  t <- dim(Y)[2] # t = T + 1 (indexing R)
+  
+  rho     <- params[1]
+  lambda  <- params[2]
+  gamma   <- params[3]
+  sigma2  <- params[4]
+  
+  
+  
+  S <- diag(N) - rho * W_1
+  
+  sum <- 0
+  
+  
+  
+  for (i in c(2:t)){
+    
+    Vt <- S %*% Y[,i] - gamma*Y[,i-1]- lambda*W_2 %*% Y[,i-1]
+    
+    sum <- sum + t(Vt) %*% Vt # sum + sum(Vt^2)
+    
+  }
+  
+  
+  
+  llsp <- -1 * ( -(N * (t-1) / 2) * log(2 * pi * sigma2) + 
+                   
+                   (t-1) * determinant(S, logarithm = TRUE)$modulus - 
+                   
+                   1 / (2 * sigma2) * sum )
+  
+  return(as.numeric(llsp))   
+}
+
+
+get_residuals <- function(params, Y, W_1, W_2) {
+  # theta c(rho,lambda,gamma,sigma2,beta_1,...,beta_K)
+  
+  N <- dim(Y)[1]
+  
+  t <- dim(Y)[2] # t = T + 1 (indexing R)
+  
+  rho     <- params[1]
+  lambda  <- params[2]
+  gamma   <- params[3]
+  sigma2  <- params[4]
+  
+  
+  
+  S <- diag(N) - rho * W_1
+  
+  sum <- 0
+  
+  residuals <- array(NA, dim = c(N, t))
+  
+  for (i in c(2:t)){
+    
+    Vt <- S %*% Y[,i] - gamma*Y[,i-1]- lambda*W_2 %*% Y[,i-1]
+    
+    residuals[,i] <- Vt
+    
+  }
+  
+  return(residuals)
+}
+
+
+```
+
+```{r, message=FALSE, cache=TRUE, warning=FALSE}
+# Set initial parameter values
+initial_params <- c(rho = 0.01,  lambda = 0.2, gamma= 0.05, sigma2 = 0.01)
+
+Y <- t(logDatar2[1:train.l, ])
+
+#Maximize the function using solnp() and optim
+
+#Picollo 
+result3 <- solnp(pars = initial_params, fun = LL_SDPD_beta,
+                 LB = c(0.00001, 0.00001, -1, 0.00001), UB = c(0.9999, 1, 1, 10),
+                 Y = Y, W_1 = Wmat3_10, W_2 = Wmat3_10, control = list(trace = 0))
+#Distance
+result1 <- solnp(pars = initial_params, fun = LL_SDPD_beta,
+                 LB = c(0.00001, 0.00001, -1, 0.00001), UB = c(0.9999, 1, 1, 10),
+                 Y = Y, W_1 = Wmat1_10, W_2 = Wmat1_10, control = list(trace = 0))
+#Correlation
+result2 <- solnp(pars = initial_params, fun = LL_SDPD_beta,
+                 LB = c(0.00001, 0.00001, -1, 0.00001), UB = c(0.9999, 1, 1, 10),
+                 Y = Y, W_1 = Wmat2_10, W_2 = Wmat2_10, control = list(trace = 0))
+
+
+# Calculating the residuals
+residuals3 <- get_residuals(result3$pars, Y, Wmat3_10, Wmat3_10) 
+residuals1 <- get_residuals(result1$pars, Y, Wmat1_10, Wmat1_10) 
+residuals2 <- get_residuals(result2$pars, Y, Wmat2_10, Wmat2_10) 
+
+#head(residuals3)
+
+#Create a data frame with an additional 'Time' column to represent the sequence of dates or time points
+residuals_df3 <- data.frame(Time = 1:nrow(t(residuals3)), t(residuals3))
+
+# Melt the data frame to long format for ggplot
+residuals_df_melted3 <- melt(residuals_df3, id.vars = "Time")
+
+
+# Plot using ggplot2
+ggplot(residuals_df_melted3, aes(x = Time, y = value)) +
+  geom_line(color = "blue", alpha = 0.8) +
+  labs(title = "SDPD model residuals for CAC40 stocks",
+       x = "Time",
+       y = "residuals3") +
+  theme_minimal() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 5)  # Adjust ncol to control the number of columns
+
+```
+
+## Estimating the spatiotemporal EGARCH Model
+
+We choose two different parameters for the leverage effect, $\theta_0$ describing the leverage effects of the contemporaneous positive and negative changes from other stocks, and $\theta_1$ for the temporal leverage effect (i.e., positive and negative changes of the same stocks in the previous period).
+
+```{r,  message=FALSE, cache=TRUE, warning=FALSE}
+#| code-fold: true
+#| code-summary: "Show SpEgarch estimation function"
+
+mean_abs_eps <- sqrt(2/pi)
+#gamma <- 0.57721
+
+
+# Numerical version to solve for epsilon
+#define the function mapping y to epsilon
+g <- function(y, alpha, rhoW_1, lambdaW_2, rho_1, lambda_1,
+              theta_0, theta_1, xi, eps_lag, Y_lag){
+  
+  n <- length(y)
+  
+  # Solve in z = log(abs(epsilon))
+  function_z <- function(z, y, alpha, rhoW_1, lambdaW_2,
+                         rho_1, lambda_1, theta_0, theta_1, xi){
+    
+    sign_y <- ifelse(y >= 0, 1, -1)
+    eps <- sign_y * exp(z)
+    
+    eps_lag_sign <- sign(eps_lag)
+    
+    return(
+      (diag(n) - lambdaW_2) %*% log(abs(y)^2) -
+        (
+          rep(alpha, n) +
+            rhoW_1 %*%
+            (theta_0 * eps +
+               xi * (abs(eps) - mean_abs_eps)) +
+            rho_1 *
+            (theta_1 * eps_lag +
+               xi * (abs(eps_lag) - mean_abs_eps)) +
+            lambda_1 *
+            (log(abs(Y_lag)^2) -
+               log(abs(eps_lag)^2)) +
+            (diag(n) - lambdaW_2) %*% log(abs(eps)^2)
+        )
+    )
+  }
+  
+  
+  # starting values: epsilon approximately equal to y
+  z0 <- log(pmax(abs(y), 1e-12))
+  
+  out <- nleqslv(
+    x = z0,
+    fn = function_z,
+    y = y,
+    alpha = alpha,
+    rhoW_1 = rhoW_1,
+    lambdaW_2 = lambdaW_2,
+    rho_1 = rho_1,
+    lambda_1 = lambda_1,
+    theta_0 = theta_0,
+    theta_1 = theta_1,
+    xi = xi,
+    control = list(ftol = 1e-12)
+  )
+  
+  
+  # Check convergence
+  if (!(out$termcd %in% c(1,2))) {
+    return(NULL)
+  }
+  
+  if (max(abs(out$fvec)) > 1e-12) {
+    return(NULL)
+  }
+  
+  
+  # Recover epsilon exactly satisfying sign restriction
+  eps <- sign(y) * exp(out$x)
+  
+  lnh <- log(abs(y)^2) - log(abs(eps)^2)
+  
+  if (length(eps) != length(y)) {
+    stop("epsilon length mismatch")
+  }
+  
+  if (max(abs(out$fvec)) > 1e-12) {
+    stop(paste("Inversion failed. Maximum residual:", max(abs(out$fvec))))
+  }
+  
+  return(list(
+    eps = eps,
+    lnh = lnh,
+    convergence = out$termcd,
+    residual = max(abs(out$fvec))
+  ))
+}
+
+
+# Define the derivative of h wrt epsilon function
+
+d_h_d_eps <- function(eps, h, theta_0, xi, rhoW_1, lambdaW_2) {
+  n <- length(eps)
+  A <- solve(diag(n) - lambdaW_2, rhoW_1)
+  gprime <- theta_0 + xi * sign(eps)
+  Dlogh <- sweep(A, 2, gprime, `*`)
+  Dh <- sweep(Dlogh, 1, h, `*`)
+  return(Dh)
+}
+
+#defining the likelihood
+
+
+likelihood <- function(params,  extra_args) {
+  
+  Y <- extra_args$Y
+  W_2 <- extra_args$W_2
+  W_1 <- extra_args$W_1
+  
+  rho_0 <- params[1]
+  rho_1 <- params[2]
+  theta_0 <- params[3]
+  theta_1 <- params[4]
+  alpha <- params[5]
+  xi <- 1
+  lambda_1 <- params[6]
+  lambda_0 <- params[7]
+  n <- nrow(Y)
+  T <- ncol(Y)
+  eps_hat <- array(0.01, dim = c(n, T))
+  
+  # Compute log of the determinant of the jacobian matrix
+  log_det_J <- numeric(T)
+  for (t in 1:T) {
+    if(t == 1){
+      out <- g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta_0 = theta_0, theta_1 = theta_1, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+               eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+    } else {
+      out <- g(Y[, t], alpha = alpha, rhoW_1 = rho_0 * W_1, lambdaW_2 = lambda_0 * W_2, theta_0 = theta_0, theta_1 = theta_1, xi = xi, rho_1 = rho_1, lambda_1 = lambda_1,
+               eps_lag = eps_hat[,t-1], Y_lag = Y[,t-1])
+    }
+    
+    if (is.null(out)) {
+      return(1e8)
+    }
+    
+    eps_hat[,t] <- out$eps
+    
+    
+    A <- solve(diag(n) - lambda_0 * W_2, rho_0 * W_1)
+    gprime <- theta_0 + xi * sign(out$eps)
+    Dlogh <- sweep(A, 2, gprime, `*`)
+    
+    M <- diag(n) +
+      0.5 * diag(out$eps) %*% Dlogh
+    
+    log_det_J[t] <-
+      0.5 * sum(out$lnh) +
+      as.numeric(determinant(M, logarithm = TRUE)$modulus)
+    
+  }
+  
+  likelihood <- sum(dnorm(eps_hat[, -(1:5)], log = TRUE)) - sum(log_det_J[-(1:5)])
+  
+  if (!is.finite(likelihood)) {
+    return(1e12)   # large finite penalty instead of returning -Inf/NaN/Inf to solnp
+  }
+  
+  return(-likelihood)
+}
+
+
+# Function to generate random parameters
+generate_random_params <- function() {
+  c(
+    rho_0 = runif(1, 0, 0.3),
+    rho_1 = runif(1, 0, 0.5),
+    theta_0 = runif(1, -0.5, 0.51),
+    theta_1 = runif(1, -0.5, 0.51),
+    alpha = sd(residuals3[,-1]), #runif(1, -0.2, 0.2),
+    lambda_1 = runif(1, 0, 0.5),
+    lambda_0 = runif(1, 0, 0.5)
+  )
+}
+
+```
+
+## Fitting the Sp-Egarch on the CAC40 residuals
+
+This section presents the code used to fit the spatiotemporal E-GARCH model to the residuals obtained from the SDPD model across all three spatial weight matrix specifications. For each case, we report the parameter estimates with their standard errors and evaluate model fit using the Akaike Information Criterion (AIC) and the Bayesian Information Criterion (BIC). Note that initial parameter values are generated by randomly sampling 100 sets of starting values from uniform distributions over plausible parameter ranges. For each set, the negative log-likelihood is computed, and the parameter vector yielding the lowest value is selected as the initial input for constrained optimization. The constraint ensures that the sum of the absolute values of the spatial coefficients in the conditional variance equation remains below one, preserving stationarity. By doing so we improve the computational efficiency and increase the chances of convergence to a global optimum.
+
+To assess model performance, we check for temporal and spatial autocorrelation in the residuals. Specifically, the Ljung-Box test is applied to each asset’s residuals and squared residuals over time, while Moran’s I test is conducted at each time point to detect spatial autocorrelation in both residuals and their squares. The plots display the corresponding p-values, with a dashed red line marking the $5\%$ significance threshold to highlight instances where residual dependencies persist.
+
+### Piccolo-based weighted matrix
+
+```{r, message=FALSE, cache=TRUE,  warning=FALSE}
+#| code-fold: true
+
+
+##################Piccolo based weighted matrix########
+
+
+extra_args3 <- list(
+  Y = residuals3[,-1],
+  W_2 = Wmat3_10,
+  W_1 = Wmat3_10
+)
+
+
+
+set.seed(123) 
+
+# Store the results
+results3 <- numeric(100)
+params_list3 <- list()
+
+for (i in 1:100) {
+  params3 <- generate_random_params()
+  params_list3[[i]] <- params3
+  
+  extra_args3 <- list(
+    Y = residuals3[,-1],
+    W_2 = Wmat3_10,
+    W_1 = Wmat3_10
+  )
+  
+  
+  # Calculate negative log-likelihood
+  neg_loglik <- likelihood(params3, extra_args3)
+  results3[i] <- neg_loglik
+}
+
+# Find the index of the best parameters
+best_index3 <- which.min(results3)
+best_params3 <- params_list3[[best_index3]]
+#print(best_params3)
+
+# Define the constraint function for |lambda_0| + |lambda_1| < 1
+constraint_function <- function(params) {
+  lambda_0 <- params["lambda_0"]
+  lambda_1 <- params["lambda_1"]
+  return(abs(lambda_0) + abs(lambda_1) - 1)
+}
+
+
+# Run optimization with best initial parameters
+resultll3 <- solnp(
+  pars = best_params3,
+  fun = function(params) likelihood(params, extra_args3),
+  ineqfun = constraint_function,  # Adding the constraint function
+  ineqLB = -Inf,  # Lower bound for the constraint (no lower bound needed)
+  ineqUB = 0,     # Upper bound for the constraint (0 means abs(lambda_0) + abs(lambda_1) <= 1
+  LB = c(0.0001, 0.0001, -1, -1, -10, 0.0001, 0.0001),
+  UB = c(0.99, 0.999999999999, 1, 1, 10, 1, 0.95),
+  control = list(trace = 0)
+)
+
+
+estimate3 <- resultll3$pars
+
+cat("Results for estimate3:\n")
+print(estimate3)
+
+# Standard error from result
+#standard_error3 <- sqrt(diag(solve(resultll3$hessian[-8,-8])))
+
+#cat("Results for standard_error3 :\n")
+#print(standard_error3)
+
+
+# Log-likelihood at optimum
+log_likelihood_opt3 <- -resultll3$values[length(resultll3$values)]  # Use the negative log-likelihood value
+
+# Number of estimated parameters
+k <- length(resultll3$pars)
+
+# Number of observations
+n <- length(residuals3[,-1])
+
+# Calculate AIC
+AIC3 <- 2 * k - 2 * log_likelihood_opt3
+cat("AIC3: ", round(AIC3, 4), "\n")
+print(AIC3)
+
+# Calculate BIC
+BIC3 <- log(n) * k - 2 * log_likelihood_opt3
+cat("BIC3:", round(BIC3, 4), "\n")
+
+
+#calcuating the squared returns
+Y <- residuals3[,-1]
+Y_squared <- Y^2
+
+#calculating the estimated volatility
+
+eps_hat3 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+h_hat3 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+
+for (t in 1:ncol(Y)) {
+  if(t == 1){
+    out <- g(Y[, t], alpha = resultll3$pars[5], rhoW_1 = resultll3$pars[1] * Wmat3_10, lambdaW_2 = resultll3$pars[7] * Wmat3_10, theta_0 = resultll3$pars[3], theta_1 = resultll3$pars[4], xi = 1, rho_1 = resultll3$pars[2], lambda_1 = resultll3$pars[6],
+             eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+  } else {
+    out <- g(Y[, t], alpha = resultll3$pars[5], rhoW_1 = resultll3$pars[1] * Wmat3_10, lambdaW_2 = resultll3$pars[7] * Wmat3_10, theta_0 = resultll3$pars[3], theta_1 = resultll3$pars[4], xi = 1, rho_1 = resultll3$pars[2], lambda_1 =  resultll3$pars[6],
+             eps_lag = eps_hat3[,t-1], Y_lag = Y[,t-1])
+  }
+  eps_hat3[,t] <- out$eps
+  
+  h_hat3[,t]  <- exp(out$lnh)
+}
+
+
+
+# Ljung-Box test for residuals and the square residuals through all  series 
+p_values_res3 <- numeric(nrow(Y))
+p_values_res_sq3 <- numeric(nrow(Y))
+
+for (i in 1: nrow(Y) ) {
+  
+  p_values_res3[i] <- Box.test(eps_hat3[i, ])$p.value
+  
+  p_values_res_sq3[i] <- Box.test(eps_hat3[i, ]^2)$p.value
+}
+
+# percentage of significant values
+percent_signi_res3 <- sum(p_values_res3 < 0.05) / nrow(Y) * 100
+percent_signi_res_sq3 <- sum(p_values_res_sq3 < 0.05) / nrow(Y) * 100
+
+cat("\nPercentage of significant p-values of Ljung-Box test for residuals and square residuals :\n")
+print(percent_signi_res3)
+print(percent_signi_res_sq3)
+
+# Create the dataframe for Ljung-Box test
+result_tablebox3 <- data.frame(
+  Series = 1:nrow(Y),
+  P_Value_Residuals3 = p_values_res3,
+  P_Value_Squared_Residuals3 = p_values_res_sq3
+)
+
+
+
+# Plot the p-values for residuals
+pbox3 <- ggplot(result_tablebox3, aes(x = Series)) +
+  geom_point(aes(y = P_Value_Residuals3, color = "Residuals"), size = 1) +
+  geom_point(aes(y = P_Value_Squared_Residuals3, color = "Squared Residuals"), size = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Ljung-Box CAC40 Test with Wmat3_5_NN",
+    x = "Series",
+    y = "P-Value",
+    color = "Test data:"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),         # Ensure axis ticks are black too
+    legend.position = "bottom"
+    )
+
+#print(pbox3)
+
+
+
+
+####Moran's I for residuals and square residuals at each time point
+
+p_moran_res3 <- numeric(ncol(Y))
+p_moran_res_sq3 <- numeric(ncol(Y))
+
+
+for (t in 1:ncol(Y)) {
+  p_moran_res3[t] <- moran.test(eps_hat3[, t], listw = mat2listw(Wmat3_10))$p.value
+  p_moran_res_sq3[t] <- moran.test(eps_hat3[, t]**2, listw = mat2listw(Wmat3_10))$p.value
+}
+
+# percentage of significant values
+per_mo_res3 <- sum(p_moran_res3 < 0.05) / ncol(Y) * 100
+per_mo_res_sq3 <- sum(p_moran_res_sq3 < 0.05) / ncol(Y) * 100
+
+cat("Percentage of significant p-values of Moran's I test for residuals and square residuals:\n")
+print(per_mo_res3)
+print(per_mo_res_sq3)
+
+
+
+# Create the dataframe for the Moran's I results
+result_table_mo3 <- data.frame(
+  Time = 1:ncol(Y),  # Time points as columns of Y
+  P_Value_Residuals_mo3 = p_moran_res3,
+  P_Value_Squared_Residuals_mo3 = p_moran_res_sq3
+)
+
+
+# Plot the p-values for Moran's I test of residuals and squared residuals
+pmo3 <- ggplot(result_table_mo3, aes(x = Time)) +
+  geom_point(aes(y = P_Value_Residuals_mo3, color = "Residuals"), size = 1) +
+  geom_point(aes(y = P_Value_Squared_Residuals_mo3, color = "Squared Residuals"), size = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Moran's I Test CAC40 with Wmat3_5_NN",
+    x = "Time",
+    y = "P-Value",
+    color = "Test data"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),         # Ensure axis ticks are black too
+    legend.position = "bottom"
+
+  )
+
+#print(pmo3)
+
+
+```
+
+### Distance based weighted matrix
+
+```{r, message=FALSE, cache=TRUE, warning=FALSE}
+#| code-fold: true
+
+########distance based weighted matrix#######
+extra_args1 <- list(
+  Y = residuals1[,-1],
+  W_2 = Wmat1_10,
+  W_1 = Wmat1_10
+)
+
+set.seed(123) 
+
+# Store the results
+results1 <- numeric(100)
+params_list1 <- list()
+
+for (i in 1:100) {
+  params1 <- generate_random_params()
+  params_list1[[i]] <- params1
+  
+  extra_args1 <- list(
+    Y = residuals1[,-1],
+    W_2 = Wmat1_10,
+    W_1 = Wmat1_10
+  )
+  
+  # Calculate negative log-likelihood
+  neg_loglik <- likelihood(params1, extra_args1)
+  results1[i] <- neg_loglik
+}
+
+# Find the index of the best parameters
+best_index1 <- which.min(results1)
+best_params1 <- params_list1[[best_index1]]
+#print(best_params1)
+
+# Run optimization with best initial parameters
+resultll1 <- solnp(
+  pars = best_params1,
+  fun = function(params) likelihood(params, extra_args1),
+  ineqfun = constraint_function,  # Adding the constraint function
+  ineqLB = -Inf,  # Lower bound for the constraint (no lower bound needed)
+  ineqUB = 0,     # Upper bound for the constraint (0 means abs(lambda_0) + abs(lambda_1) <= 1
+  LB = c(0.0001, 0.0001, -1, -1, -10, 0.0001, 0.0001),
+  UB = c(0.99, 0.999999999999, 1, 1, 10, 1, 0.99),
+  control = list(trace = 0)
+)
+
+estimate1 <- resultll1$pars
+
+cat("Result for estimate1 :\n")
+print(estimate1)
+
+# Standard error
+#standard_error1 <- sqrt(diag(solve(resultll1$hessian[-8,-8])))
+
+#cat("Result for standard_error1 :\n")
+#print(standard_error1)
+
+# Log-likelihood at optimum
+log_likelihood_opt1 <- -resultll1$values[length(resultll1$values)]  # Use the negative log-likelihood value
+
+# Number of estimated parameters
+k <- length(resultll1$pars)
+
+# Number of observations
+n <- length(t(logDatar2[1:train.l, ]))
+
+# Calculate AIC
+AIC1 <- 2 * k - 2 * log_likelihood_opt1
+cat("AIC1: ", round(AIC1, 4), "\n")
+
+# Calculate BIC
+BIC1 <- log(n) * k - 2 * log_likelihood_opt1
+cat("BIC1:", round(BIC1, 4), "\n")
+
+
+#calcuating the squared returns
+Y <- residuals1[,-1]
+Y_squared <- Y^2
+
+#calculating the estimated volatility
+
+eps_hat1 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+h_hat1 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+
+for (t in 1:ncol(Y)) {
+  if(t == 1){
+    out <- g(Y[, t], alpha = resultll1$pars[5], rhoW_1 = resultll1$pars[1] * Wmat1_10, lambdaW_2 = resultll1$pars[7] * Wmat1_10, theta_0 = resultll1$pars[3], theta_1 = resultll1$pars[4], xi = 1, rho_1 = resultll1$pars[2], lambda_1 = resultll1$pars[6],
+             eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+  } else {
+    out <- g(Y[, t], alpha = resultll1$pars[5], rhoW_1 = resultll1$pars[1] * Wmat1_10, lambdaW_2 = resultll1$pars[7] * Wmat1_10, theta_0 = resultll1$pars[3], theta_1 = resultll1$pars[4], xi = 1, rho_1 = resultll1$pars[2], lambda_1 =  resultll1$pars[6],
+             eps_lag = eps_hat1[,t-1], Y_lag = Y[,t-1])
+  }
+  eps_hat1[,t] <- out$eps
+  
+  h_hat1[,t]  <- exp(out$lnh)
+}
+
+
+
+# Ljung-Box test for residuals and the square residuals through all  series 
+p_values_res1 <- numeric(nrow(Y))
+p_values_res_sq1 <- numeric(nrow(Y))
+
+for (i in 1: nrow(Y) ) {
+  
+  p_values_res1[i] <- Box.test(eps_hat1[i, ])$p.value
+  
+  p_values_res_sq1[i] <- Box.test(eps_hat1[i, ]^2)$p.value
+}
+
+# percentage of significant values
+percent_signi_res1 <- sum(p_values_res1 < 0.05) / nrow(Y) * 100
+percent_signi_res_sq1 <- sum(p_values_res_sq1 < 0.05) / nrow(Y) * 100
+
+cat("Percentage of significant p-values of Ljung-Box test for residuals and square residuals :\n")
+print(percent_signi_res1)
+print(percent_signi_res_sq1)
+
+# Create the dataframe for Ljung-Box test
+result_tablebox1 <- data.frame(
+  Series = 1:nrow(Y),
+  P_Value_Residuals1 = p_values_res1,
+  P_Value_Squared_Residuals1 = p_values_res_sq1
+)
+
+
+# Plot the p-values for residuals
+pbox1 <- ggplot(result_tablebox1, aes(x = Series)) +
+  geom_point(aes(y = P_Value_Residuals1, color = "Residuals"), size = 1) +
+  geom_point(aes(y = P_Value_Squared_Residuals1, color = "Squared Residuals"), size = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Ljung-Box CAC40 with Wmat1_5_NN",
+    x = "Series",
+    y = "P-Value",
+    color = "Data type"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),          # Ensure axis ticks are black too
+    legend.position = "none" 
+  )
+
+#print(pbox1)
+
+
+
+####Moran's I for residuals and square residuals at each time point
+p_moran_res1 <- numeric(ncol(Y))
+p_moran_res_sq1 <- numeric(ncol(Y))
+
+
+for (t in 1:ncol(Y)) {
+  p_moran_res1[t] <- moran.test(eps_hat1[, t], listw = mat2listw(Wmat1_10))$p.value
+  p_moran_res_sq1[t] <- moran.test(eps_hat1[, t]**2, listw = mat2listw(Wmat1_10))$p.value
+}
+
+# percentage of significant values
+per_mo_res1 <- sum(p_moran_res1 < 0.05) / ncol(Y) * 100
+per_mo_res_sq1 <- sum(p_moran_res_sq1 < 0.05) / ncol(Y) * 100
+
+cat("Percentage of significant p-values of Moran's I test for residuals and square residuals:\n")
+print(per_mo_res1)
+print(per_mo_res_sq1)
+
+# Create the dataframe for the Moran's I results
+result_table_mo1 <- data.frame(
+  Time = 1:ncol(Y),  # Time points as columns of Y
+  P_Value_Residuals_mo1 = p_moran_res1,
+  P_Value_Squared_Residuals_mo1 = p_moran_res_sq1
+)
+
+
+
+# Plot the p-values for Moran's I test of residuals and squared residuals
+pmo1 <- ggplot(result_table_mo1, aes(x = Time)) +
+  geom_point(aes(y = P_Value_Residuals_mo1, color = "Residuals"), size = 1) +
+  geom_point(aes(y = P_Value_Squared_Residuals_mo1, color = "Squared Residuals"), size = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Moran's I CAC40 with Wmat1_5_NN",
+    x = "Time",
+    y = "P-Value",
+    color = "Data type"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),          # Ensure axis ticks are black too
+    legend.position = "none" 
+  )
+
+#print(pmo1)
+
+
+```
+
+### Correlation based weighted matrix
+
+```{r, message=FALSE, cache=TRUE, warning=FALSE}
+#| code-fold: true
+
+##################correlation based weighted matrix########
+
+extra_args2 <- list(
+  Y = residuals2[,-1],
+  W_2 = Wmat2_10,
+  W_1 = Wmat2_10
+)
+
+
+set.seed(123) 
+
+
+# Store the results
+results2 <- numeric(100)
+params_list2 <- list()
+
+for (i in 1:100) {
+  params2 <- generate_random_params()
+  params_list2[[i]] <- params2
+  
+  extra_args2 <- list(
+    Y = residuals2[,-1],
+    W_2 = Wmat2_10,
+    W_1 = Wmat2_10
+  )
+  
+  
+  # Calculate negative log-likelihood
+  neg_loglik <- likelihood(params2, extra_args2)
+  results2[i] <- neg_loglik
+}
+
+# Find the index of the best parameters
+best_index2 <- which.min(results2)
+best_params2 <- params_list2[[best_index2]]
+#print(best_params2)
+
+
+# Run optimization with best initial parameters
+resultll2 <- solnp(
+  pars = best_params2,
+  fun = function(params) likelihood(params, extra_args2),
+  ineqfun = constraint_function,  # Adding the constraint function
+  ineqLB = -Inf,  # Lower bound for the constraint (no lower bound needed)
+  ineqUB = 0,     # Upper bound for the constraint (0 means abs(lambda_0) + abs(lambda_1) <= 1
+  LB = c(0.0001, 0.0001, -1, -1, -10, 0.0001, 0.0001),
+  UB = c(0.99, 0.999999999999, 1, 1, 10, 1, 0.99),
+  control = list(trace = 0)
+)
+
+
+estimate2 <- resultll2$pars
+cat("Result for estimate2 :\n")
+print(estimate2)
+
+
+# Standard from the result
+#standard_error2 <- sqrt(diag(solve(resultll2$hessian[-8,-8])))
+
+#cat("Result for standard_error2 :\n")
+#print(standard_error2)
+
+
+# Log-likelihood at optimum
+log_likelihood_opt2 <- -resultll2$values[length(resultll2$values)]  # Use the negative log-likelihood value
+
+# Number of estimated parameters
+k <- length(resultll2$pars)
+
+# Number of observations
+n <- length(logDatar2[1:train.l, ])
+
+# Calculate AIC
+AIC2 <- 2 * k - 2 * log_likelihood_opt2
+
+cat("AIC2:", round(AIC2, 4), "\n")
+
+
+# Calculate BIC
+BIC2 <- log(n) * k - 2 * log_likelihood_opt2
+cat("BIC2:", round(BIC2, 4), "\n")
+
+#calcuating the squared returns
+Y <- residuals2[,-1]
+Y_squared <- Y^2
+
+#calculating the estimated volatility
+
+eps_hat2 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+h_hat2 <- array(0.01, dim = c(nrow(Y), ncol(Y)))
+
+for (t in 1:ncol(Y)) {
+  if(t == 1){
+    out <- g(Y[, t], alpha = resultll2$pars[5], rhoW_1 = resultll2$pars[1] * Wmat2_10, lambdaW_2 = resultll2$pars[7] * Wmat2_10, theta_0 = resultll2$pars[3], theta_1 = resultll2$pars[4], xi = 1, rho_1 = resultll2$pars[2], lambda_1 = resultll2$pars[6],
+             eps_lag = rep(0.001, length(Y[, t])), Y_lag = rep(0.001, length(Y[, t])))
+  } else {
+    out <- g(Y[, t], alpha = resultll2$pars[5], rhoW_1 = resultll2$pars[1] * Wmat2_10, lambdaW_2 = resultll2$pars[7] * Wmat2_10, theta_0 = resultll2$pars[3], theta_1 = resultll2$pars[4], xi = 1, rho_1 = resultll2$pars[2], lambda_1 =  resultll2$pars[6],
+             eps_lag = eps_hat2[,t-1], Y_lag = Y[,t-1])
+  }
+  eps_hat2[,t] <- out$eps
+  
+  h_hat2[,t]  <- exp(out$lnh)
+}
+
+
+
+# Ljung-Box test for residuals and the square residuals through all  series 
+p_values_res2 <- numeric(nrow(Y))
+p_values_res_sq2 <- numeric(nrow(Y))
+
+for (i in 1: nrow(Y) ) {
+  
+  p_values_res2[i] <- Box.test(eps_hat2[i, ])$p.value
+  
+  p_values_res_sq2[i] <- Box.test(eps_hat2[i, ]^2)$p.value
+}
+
+# percentage of significant values
+percent_signi_res2 <- sum(p_values_res2 < 0.05) / nrow(Y) * 100
+percent_signi_res_sq2 <- sum(p_values_res_sq2 < 0.05) / nrow(Y) * 100
+
+cat("Percentage of significant p-values of Ljung-Box test for residuals and square residuals:\n")
+print(percent_signi_res2)
+print(percent_signi_res_sq2)
+
+# Create the dataframe for Ljung-Box test
+result_tablebox2 <- data.frame(
+  Series = 1:nrow(Y),
+  P_Value_Residuals2 = p_values_res2,
+  P_Value_Squared_Residuals2 = p_values_res_sq2
+)
+
+
+
+# Plot the p-values for residuals
+pbox2 <- ggplot(result_tablebox2, aes(x = Series)) +
+  geom_point(aes(y = P_Value_Residuals2, color = "Residuals"), size = 2) +
+  geom_point(aes(y = P_Value_Squared_Residuals2, color = "Squared Residuals"), size = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Ljung-Box CAC40 with Wmat2_5_NN",
+    x = "Series",
+    y = "P-Value",
+    color = "Data type"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),          # Ensure axis ticks are black too
+    legend.position = "none" 
+  )
+
+#print(pbox2)
+
+
+
+####Moran's I for residuals and square residuals at each time point
+p_moran_res2 <- numeric(ncol(Y))
+p_moran_res_sq2 <- numeric(ncol(Y))
+
+
+for (t in 1:ncol(Y)) {
+  p_moran_res2[t] <- moran.test(eps_hat2[, t], listw = mat2listw(Wmat2_10))$p.value
+  p_moran_res_sq2[t] <- moran.test(eps_hat2[, t]**2, listw = mat2listw(Wmat2_10))$p.value
+}
+
+# percentage of significant values
+per_mo_res2 <- sum(p_moran_res2 < 0.05) / ncol(Y) * 100
+per_mo_res_sq2 <- sum(p_moran_res_sq2 < 0.05) / ncol(Y) * 100
+
+cat("Percentage of significant p-values of Moran's I test for residuals and square residuals:\n")
+print(per_mo_res2)
+print(per_mo_res_sq2)
+
+# Create the dataframe for the Moran's I results
+result_table_mo2 <- data.frame(
+  Time = 1:ncol(Y),  # Time points as columns of Y
+  P_Value_Residuals_mo2 = p_moran_res2,
+  P_Value_Squared_Residuals_mo2 = p_moran_res_sq2
+)
+
+
+
+# Plot the p-values for Moran's I test of residuals and squared residuals
+pmo2 <- ggplot(result_table_mo2, aes(x = Time)) +
+  geom_point(aes(y = P_Value_Residuals_mo2, color = "Residuals"), size = 2) +
+  geom_point(aes(y = P_Value_Squared_Residuals_mo2, color = "Squared Residuals"), size = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Moran's I Test CAC40 with Wmat2_5_NN",
+    x = "Time",
+    y = "P-Value",
+    color = "Data type"
+  ) +
+  scale_color_manual(values = c("Residuals" = "blue", "Squared Residuals" = "green")) +
+  theme_minimal()  +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),  # Bold and larger title
+    legend.title = element_text(size = 10, face = "bold"),  # Bold legend title
+    legend.text = element_text(size = 10),   # Bold legend labels
+    panel.background = element_rect(fill = "white", color = NA),  # Set axis background to grey
+    axis.line = element_line(color = "black"),          # Make x and y axes black
+    axis.ticks = element_line(color = "black"),          # Ensure axis ticks are black too
+    legend.position = "none" 
+  )
+
+#print(pmo2)
+
+
+```
+
+### Combined plots :
+
+```{r, message=FALSE, warning=FALSE}
+##combine plots
+
+# Function to extract legend
+get_legend <- function(plot) {
+  ggplotGrob(plot)$grobs[[which(sapply(ggplotGrob(plot)$grobs, function(x) x$name) == "guide-box")]]
+}
+
+###for Ljung-Box test
+legend <- get_legend(pbox3)  # Extract legend from pbox3
+
+# Remove individual legends
+pbox3 <- pbox3 + theme(legend.position = "none")
+
+# Arrange plots in one row with shared legend below
+grid.arrange(
+  arrangeGrob(pbox1, pbox2, pbox3, ncol = 3),
+  legend,
+  nrow = 2,
+  heights = c(5, 1)  # Adjust legend height
+)
+
+
+### for Moran's test
+
+
+legend2 <- get_legend(pmo3)  # Extract legend from pbox3
+
+# Remove individual legends
+pmo3 <- pmo3 + theme(legend.position = "none")
+
+# Arrange plots in one row with shared legend below
+grid.arrange(
+  arrangeGrob(pmo1, pmo2, pmo3, ncol = 3),
+  legend,
+  nrow = 2,
+  heights = c(5, 1)  # Adjust legend height
+)
+
+```
+
+
+# References
+
